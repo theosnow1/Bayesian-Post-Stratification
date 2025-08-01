@@ -1,0 +1,307 @@
+---
+title: "Bayesian Practice — Cleaned Pipeline"
+author: "Theo Snow"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: united
+params:
+  input_csv: ""  
+  seed: 123                                   
+  bayes_draws: 1000                         
+  treatment_prob: 0.5                       
+  p0: 0.3                                     
+  p1: 0.5                                     
+---
+Please Note: This github repo is solely a record of work. This is not meant as a reproducible pipeline, as the data leveraged for this project contains PHI. I have removed the data calls so this HTML knit displays errors after every cell. This is not representative of the quality of my code, but rather that nothing below will run without the data I have intentionally removed. 
+
+## **0. Options and Helper Functions**
+```{r}
+# ---- options ----
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = TRUE,
+  message = TRUE,
+  error = TRUE
+)
+```
+
+```{r setup, include=FALSE}
+
+options(width = 120, scipen = 999)
+set.seed(params$seed)
+
+required_pkgs <- c(
+  "tidyverse", "broom", "scales", "rlang", "glue", "patchwork"
+)
+invisible(lapply(required_pkgs, function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    stop(glue::glue("Required package '{pkg}' is not installed."))
+  }
+  library(pkg, character.only = TRUE)
+}))
+
+safe_select <- function(df, cols) {
+  df %>% select(any_of(cols))
+}
+
+safe_load_csv <- function(path) {
+  if (!file.exists(path)) {
+    warning(glue::glue("File '{path}' not found. Falling back to synthetic toy data."))
+    return(NULL)
+  }
+  read.csv(path)
+}
+
+simulate_treatment_and_outcomes <- function(df, treatment_prob, p0, p1, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  df %>%
+    mutate(
+      treatment = rbinom(nrow(.), size = 1, prob = treatment_prob),  # binary per row/stratum
+      Y0 = rbinom(nrow(.), size = Sample_Strata_Denom, prob = p0),
+      Y1 = rbinom(nrow(.), size = Sample_Strata_Denom, prob = p1),
+      outcome = ifelse(treatment == 1, Y1, Y0),
+      outcome_rate = outcome / Sample_Strata_Denom
+    )
+}
+
+compute_deterministic_ate <- function(df, weight_col = "weights") {
+  w <- sym(weight_col)
+  df %>%
+    summarise(
+      ate = sum((!!w) * outcome * treatment) / sum((!!w) * treatment) -
+            sum((!!w) * outcome * (1 - treatment)) / sum((!!w) * (1 - treatment))
+    )
+}
+
+bayesian_ate_distribution <- function(df, draws = 1000) {
+  replicate(draws, {
+    weight_draws <- with(df, {
+      rbeta(nrow(df), Posterior_Alpha, Posterior_Beta) * Sample_Total_Denom / Sample_Strata_Denom
+    })
+    sum(weight_draws * df$outcome * df$treatment) / sum(weight_draws * df$treatment) -
+      sum(weight_draws * df$outcome * (1 - df$treatment)) / sum(weight_draws * (1 - df$treatment))
+  })
+}
+
+fit_quasi_poisson <- function(df, formula, offset_col, weight_col = NULL) {
+  fm <- formula
+  offset_term <- rlang::expr(offset(log(!!sym(offset_col))))
+  if (!is.null(weight_col)) {
+    model <- glm(
+      eval(fm),
+      data = df,
+      family = quasipoisson(link = "log"),
+      offset = eval(offset_term),
+      weights = df[[weight_col]]
+    )
+  } else {
+    model <- glm(
+      eval(fm),
+      data = df,
+      family = quasipoisson(link = "log"),
+      offset = eval(offset_term)
+    )
+  }
+  tidy_res <- broom::tidy(model, exponentiate = TRUE, conf.int = TRUE)
+  tidy_res
+}
+
+ci_to_sd <- function(mean_val, ci_lower, ci_upper, z = 1.96) {
+  (ci_upper - ci_lower) / (2 * z)
+}
+```
+
+## **1. Load and Transform Data**
+```{r}
+
+merged_data_1 <- read.csv("")
+
+set.seed(123)  # reproducible
+
+merged_data_1_extended <- merged_data_1 %>%
+  mutate(
+    n = Sample_Strata_Denom,
+    n_treated = rbinom(n(), size = n, prob = 0.5),
+    n_control = n - n_treated,
+
+    Y_treated = rbinom(n(), size = n_treated, prob = 0.5), 
+    Y_control = rbinom(n(), size = n_control, prob = 0.3),  
+
+    outcome = Y_treated + Y_control,
+
+    treatment_prop = if_else(n > 0, n_treated / n, NA_real_),
+    outcome_rate = if_else(n > 0, outcome / n, NA_real_),
+
+    ate_stratum = case_when(
+      n_treated > 0 & n_control > 0 ~ (Y_treated / n_treated) - (Y_control / n_control),
+      TRUE ~ NA_real_
+    )
+  )
+```
+
+## **2. Simulate treatment/outcomes**
+```{r}
+required_cols <- c("Sample_Strata_Denom")
+stopifnot(all(required_cols %in% names(merged_data_1)))
+
+merged_data_1_extended <- simulate_treatment_and_outcomes(
+  merged_data_1,
+  treatment_prob = params$treatment_prob,
+  p0 = params$p0,
+  p1 = params$p1,
+  seed = params$seed + 1
+)
+
+merged_data_1_extended %>% slice_head(n = 5)
+
+```
+## **3. ATE Estimation**
+```{r}
+stopifnot(c("weights", "Posterior_Alpha", "Posterior_Beta",
+            "Sample_Total_Denom", "Sample_Strata_Denom", "treatment", "outcome") %in% names(merged_data_1_extended))
+
+# Deterministic ATE
+deterministic_ate <- compute_deterministic_ate(merged_data_1_extended, weight_col = "weights") %>%
+  mutate(method = "Deterministic")
+
+# Bayesian ATE draws
+bayes_results <- bayesian_ate_distribution(merged_data_1_extended, draws = params$bayes_draws)
+bayesian_summary <- tibble(
+  ate_mean = mean(bayes_results),
+  ate_lower = quantile(bayes_results, 0.025),
+  ate_upper = quantile(bayes_results, 0.975),
+  method = "Bayesian"
+)
+
+# Combine for plotting
+comparison_df <- bind_rows(
+  deterministic_ate %>%
+    transmute(method, ate, lower = ate, upper = ate),
+  bayesian_summary %>%
+    transmute(method, ate = ate_mean, lower = ate_lower, upper = ate_upper)
+)
+
+comparison_df
+```
+## **4. ATE Visualization**
+```{r}
+ggplot(comparison_df, aes(x = method, y = ate, color = method)) +
+  geom_point(size = 4) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2, size = 1) +
+  geom_hline(yintercept = 140, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Estimated ATE: Deterministic vs Bayesian Weights",
+    subtitle = glue::glue("True ATE = {140} (dashed line)"),
+    y = "ATE",
+    x = NULL
+  ) +
+  scale_color_manual(values = c("Deterministic" = "#d95f02", "Bayesian" = "#1b9e77")) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## **5. Weight Distributions**
+```{r}
+bayes_weight_dist <- ggplot(merged_data_1, aes(x = weight_mean)) +
+  geom_histogram(bins = 30, fill = "skyblue", alpha = 0.6) +
+  labs(title = "Distribution of Bayesian Posterior Mean Weights", x = "Bayesian Mean Weight", y = "Count") +
+  theme_minimal()
+
+# Deterministic weight distribution
+det_weight_dist <- ggplot(merged_data_1, aes(x = weights)) +
+  geom_histogram(bins = 30, fill = "coral", alpha = 0.6) +
+  labs(title = "Distribution of Deterministic Weights", x = "Deterministic Weight", y = "Count") +
+  theme_minimal()
+
+# Side-by-side
+bayes_weight_dist + det_weight_dist + plot_annotation(title = "Weight Comparisons")
+```
+## **6. Stochastic Weight Model**
+```{r}
+stopifnot(all(c("Year", "Sample_Strata_Denom", "Sample_Total_Denom") %in% names(merged_data_1)))
+
+# Deterministic model: weight_mean treated as deterministic weight (example)
+mod_det <- fit_quasi_poisson(
+  df = merged_data_1,
+  formula = quote(Sample_Strata_Denom ~ as.factor(Year)),
+  offset_col = "Sample_Total_Denom",
+  weight_col = "weight_mean"
+) %>%
+  mutate(model = "Deterministic") %>%
+  mutate(mean_estimate = estimate)
+
+simulate_yearly_model <- function(df, n_sim = 10) {
+  coef_list <- vector("list", n_sim)
+  for (i in seq_len(n_sim)) {
+    df_sim <- df %>%
+      mutate(
+        weight_sim = rbeta(n(), Posterior_Alpha, Posterior_Beta)
+      ) %>%
+      mutate(
+        weight_sim = weight_sim * (sum(weight_mean, na.rm = TRUE) / sum(weight_sim, na.rm = TRUE))  # <- normalization example
+      )
+    tmp <- fit_quasi_poisson(
+      df = df_sim,
+      formula = quote(Sample_Strata_Denom ~ as.factor(Year)),
+      offset_col = "Sample_Total_Denom",
+      weight_col = "weight_sim"
+    ) %>%
+      mutate(sim_id = i)
+    coef_list[[i]] <- tmp
+  }
+  bind_rows(coef_list)
+}
+coef_stochastic_raw <- simulate_yearly_model(merged_data_1, n_sim = 10)
+```
+## **7. Stochastic Model Output**
+```{r}
+stoch_summary <- coef_stochastic_raw %>%
+  filter(str_detect(term, "^as.factor\\(Year\\)")) %>%
+  mutate(year = str_remove(term, "as.factor\\(Year\\)")) %>%
+  group_by(year) %>%
+  summarise(
+    mean_estimate = mean(estimate),
+    lower_95 = quantile(estimate, 0.025),
+    upper_95 = quantile(estimate, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(model = "Stochastic")
+
+det_summary <- mod_det %>%
+  filter(str_detect(term, "^as.factor\\(Year\\)")) %>%
+  mutate(
+    year = str_remove(term, "as.factor\\(Year\\)"),
+    mean_estimate = estimate,
+    lower_95 = conf.low,
+    upper_95 = conf.high,
+    model = "Deterministic"
+  ) %>%
+  select(year, mean_estimate, lower_95, upper_95, model)
+
+combined_model_estimates <- bind_rows(stoch_summary, det_summary) %>%
+  mutate(year = factor(year, levels = sort(unique(year))))
+```
+
+##**8. Stochastic Model Visualization**
+```{r}
+ggplot(combined_model_estimates, aes(x = year, y = mean_estimate, color = model, group = model)) +
+  geom_point(position = position_dodge(width = 0.4), size = 3) +
+  geom_line(position = position_dodge(width = 0.4)) +
+  geom_errorbar(aes(ymin = lower_95, ymax = upper_95), width = 0.2,
+                position = position_dodge(width = 0.4), alpha = 0.7) +
+  labs(
+    title = "Yearly Coefficient Estimates: Deterministic vs Stochastic",
+    x = "Year",
+    y = "Exponentiated Coefficient (Rate Ratio)",
+    color = "Model"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c("Deterministic" = "#d95f02", "Stochastic" = "#1b9e77")) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray40")
+```
+
+
+
