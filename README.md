@@ -1,2 +1,2 @@
 # Bayesian-Post-Stratification
-Reproducible RMarkdown pipeline comparing deterministic vs Bayesian post-stratification weights for ATE estimation in pre-stratified samples. Features data fallback, treatment/outcome simulation, quasi-Poisson modeling, posterior sampling, and visualizations of weight and effect uncertainty.
+RMarkdown pipeline comparing deterministic vs Bayesian post-stratification weights for ATE estimation in pre-stratified samples. Features data fallback, treatment/outcome simulation, quasi-Poisson modeling, posterior sampling, and visualizations of weight and effect uncertainty. This is not meant as a reproducible pipeline, as the data leveraged for this project contains PHI. This is a record of work. 
